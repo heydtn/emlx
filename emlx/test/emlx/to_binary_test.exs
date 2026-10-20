@@ -1,6 +1,8 @@
 defmodule EMLX.ToBinaryTest do
   use EMLX.Case, async: true
 
+  import Bitwise
+
   test "to_binary for contiguous tensor" do
     t = Nx.iota({4, 3}, type: :f32, backend: EMLX.Backend)
     ref = Nx.iota({4, 3}, type: :f32, backend: Nx.BinaryBackend)
@@ -68,5 +70,74 @@ defmodule EMLX.ToBinaryTest do
     :erlang.garbage_collect()
     assert byte_size(bin) == 3 * 4 * 4
     assert :binary.copy(bin) == bin
+  end
+
+  test "f8 round-trips every non-NaN value" do
+    codes = for byte <- 0..255, (byte &&& 0x7F) <= 0x7C, into: <<>>, do: <<byte>>
+    t = Nx.from_binary(codes, {:f, 8}, backend: EMLX.Backend)
+    assert Nx.to_binary(t) == codes
+  end
+
+  test "f8 keeps NaN" do
+    f8_nans = Nx.from_binary(<<0x7E, 0xFE>>, {:f, 8}, backend: EMLX.Backend)
+    assert f8_nans |> Nx.is_nan() |> Nx.to_flat_list() == [1, 1]
+
+    f16_nans =
+      Nx.from_binary(
+        <<0x7C01::16-native, 0x7FFF::16-native, 0xFFFF::16-native>>,
+        {:f, 16},
+        backend: EMLX.Backend
+      )
+
+    assert f16_nans |> Nx.as_type(:f8) |> Nx.to_binary() == <<0x7E, 0x7E, 0xFE>>
+  end
+
+  test "f8 rounds to nearest, ties to even" do
+    decode = fn code ->
+      <<value::float-big-16>> = <<code, 0>>
+      value
+    end
+
+    cases =
+      for code <- 0..0x7A, sign <- [0, 0x80] do
+        low = decode.(sign ||| code)
+        high = decode.(sign ||| code + 1)
+        quarter = (high - low) / 4
+        even = sign ||| code + rem(code, 2)
+
+        [
+          {low, sign ||| code},
+          {low + quarter, sign ||| code},
+          {low + 2 * quarter, even},
+          {high - quarter, sign ||| code + 1}
+        ]
+      end
+
+    {values, expected} = cases |> List.flatten() |> Enum.unzip()
+
+    t =
+      values
+      |> Nx.tensor(type: :f16, backend: EMLX.Backend)
+      |> Nx.as_type(:f8)
+
+    assert Nx.to_binary(t) == :binary.list_to_bin(expected)
+  end
+
+  test "f8 rounds past the largest finite value to infinity" do
+    t =
+      [61_408.0, 61_440.0, -61_440.0]
+      |> Nx.tensor(type: :f16, backend: EMLX.Backend)
+      |> Nx.as_type(:f8)
+
+    assert Nx.to_binary(t) == <<0x7B, 0x7C, 0xFC>>
+  end
+
+  test "f8 results are finite" do
+    t =
+      [0.875, 3.5]
+      |> Nx.tensor(type: :f8, backend: EMLX.Backend)
+      |> Nx.sqrt()
+
+    assert Nx.to_flat_list(t) == [0.875, 1.75]
   end
 end

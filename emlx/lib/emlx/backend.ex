@@ -6,6 +6,7 @@ defmodule EMLX.Backend do
 
   require EMLX.Debug
   import EMLX.Debug, only: [assert_no_nan_inf!: 2]
+  import Bitwise
 
   # Compile-time debug flag. Defaults to false (zero runtime cost when off).
   # Enable only in development via config/dev.exs:
@@ -383,32 +384,11 @@ defmodule EMLX.Backend do
   defp maybe_modify_binary(binary, type, type), do: binary
 
   defp maybe_modify_binary(binary, {:f, 8}, {:f, 16}) do
-    for <<byte::8 <- binary>>, into: <<>> do
-      case read_f8(<<byte::8>>) do
-        :nan ->
-          Nx.Type.nan_binary({:f, 16})
-
-        :infinity ->
-          Nx.Type.infinity_binary({:f, 16})
-
-        :neg_infinity ->
-          Nx.Type.neg_infinity_binary({:f, 16})
-
-        number ->
-          <<number::float-native-size(16)>>
-      end
-    end
+    for <<byte::8 <- binary>>, into: <<>>, do: <<byte <<< 8::16-native>>
   end
 
   defp maybe_modify_binary(binary, {:f, 16}, {:f, 8}) do
-    for <<float::16 <- binary>>, into: <<>> do
-      case <<float::16-native>> do
-        <<float::float-native-16>> -> write_finite_f8(float)
-        <<0xFC00::16-native>> -> write_non_finite(:neg_infinity, 8)
-        <<0x7C00::16-native>> -> write_non_finite(:infinity, 8)
-        _ -> write_non_finite(:nan, 8)
-      end
-    end
+    for <<bits::16-native <- binary>>, into: <<>>, do: <<f16_to_f8(bits)::8>>
   end
 
   defp maybe_modify_binary(binary, {:f, 64}, {:f, 32}) do
@@ -451,28 +431,10 @@ defmodule EMLX.Backend do
     end
   end
 
-  defp read_f8(<<0xFC::8-native>>), do: :neg_infinity
-  defp read_f8(<<0x7C::8-native>>), do: :infinity
-  defp read_f8(<<_sign::1, 31::5, mantissa::2>>) when mantissa != 0, do: :nan
-
-  defp read_f8(<<sign::1, exp::5, mantissa::2>>) do
-    float = :math.pow(2, exp - 15) * (1 + mantissa / 4)
-
-    case sign do
-      0 -> float
-      _ -> -float
-    end
-  end
-
-  if System.endianness() == :little do
-    def write_finite_f8(x) do
-      binary_part(<<x::float-native-16>>, 0, 1)
-    end
-  else
-    def write_finite_f8(x) do
-      binary_part(<<x::float-native-16>>, 1, 1)
-    end
-  end
+  # Drops the low byte of an F16, rounding to nearest with ties to even. NaN
+  # stays NaN, and overflow carries into infinity.
+  defp f16_to_f8(bits) when (bits &&& 0x7FFF) > 0x7C00, do: (bits >>> 8 &&& 0x80) ||| 0x7E
+  defp f16_to_f8(bits), do: (bits + 0x7F + (bits >>> 8 &&& 1)) >>> 8
 
   for size <- [8, 16, 32, 64] do
     def write_non_finite(data, unquote(size)) do
